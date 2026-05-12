@@ -51,7 +51,6 @@ public class Developer {
 
 ![MySQL](https://img.shields.io/badge/MySQL-005C84?style=for-the-badge&logo=mysql&logoColor=white)
 ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-316192?style=for-the-badge&logo=postgresql&logoColor=white)
-![H2](https://img.shields.io/badge/H2-0000BB?style=for-the-badge&logo=h2&logoColor=white)
 
 ### 🏗️ Conceitos & Práticas
 
@@ -68,7 +67,6 @@ public class Developer {
 ![Docker](https://img.shields.io/badge/Docker-2CA5E0?style=for-the-badge&logo=docker&logoColor=white)
 ![Postman](https://img.shields.io/badge/Postman-FF6C37?style=for-the-badge&logo=postman&logoColor=white)
 ![IntelliJ IDEA](https://img.shields.io/badge/IntelliJ_IDEA-000000?style=for-the-badge&logo=intellij-idea&logoColor=white)
-![Swagger](https://img.shields.io/badge/Swagger-85EA2D?style=for-the-badge&logo=swagger&logoColor=black)
 
 ---
 
@@ -85,46 +83,28 @@ public class Developer {
 
 ---
 
-## 📊 GitHub Stats
-
-<div align="center">
-
-![GitHub Stats](https://github-readme-stats.vercel.app/api?username=seu-usuario&show_icons=true&theme=tokyonight&include_all_commits=true&count_private=true)
-
-![Top Langs](https://github-readme-stats.vercel.app/api/top-langs/?username=seu-usuario&layout=compact&langs_count=7&theme=tokyonight)
-
-</div>
-
 ---
-
-## 🔥 Streak
-
-<div align="center">
-
-[![GitHub Streak](https://streak-stats.demolab.com?user=seu-usuario&theme=tokyonight&border_radius=5)](https://git.io/streak-stats)
-
-</div>
 
 ---
 
 ## 📌 Projetos em Destaque
 
-> ⭐ Atualize com seus projetos reais!
+### 🔹 [screenmatch-without-web]([https://github.com/seu-usuario/projeto1](https://github.com/Guui360gpa/screenmatch-without-web-))
+> Plataforma de streaming desenvolvida em Java, que consome uma API REST.  
+> `Java` `Spring Boot` `API HTTP` `Jackson` `POO` `Maven`
 
-### 🔹 [Nome do Projeto 1](https://github.com/seu-usuario/projeto1)
-> API RESTful desenvolvida com Spring Boot, JWT e PostgreSQL.  
-> `Java` `Spring Boot` `PostgreSQL` `JWT` `Docker`
+### 🔹 [consulta-fipe-spring]([https://github.com/seu-usuario/projeto2](https://github.com/Guui360gpa/consulta-fipe-spring))
+> Aplicação Spring Boot para conulta de preços FIPE de veículos via API REST.
+> `Java` `Design Patterns` `Maven` `Spring Boot` `API REST`
 
-### 🔹 [Nome do Projeto 2](https://github.com/seu-usuario/projeto2)
-> Sistema de gerenciamento com padrões de projeto e arquitetura limpa.  
-> `Java` `Design Patterns` `MySQL` `Spring Security`
+### 🔹 [cripto-price-api-client]([https://github.com/Guui360gpa/crypto-price-api-client)
+> Buscar e exibir o valor atualizado de criptomoedas em tempo real integrado com API REST.
+> `Java` `Design Patterns` `Maven` `Spring Boot` `JSON`
+
+### 🔹 [smashpointlanchonete-api]([https://github.com/Guui360gpa/smashpoint-lanchonete-api-java)
+> Sistema de gerenciamento de pedidos via JSON.
+> `Java` `Design Patterns` `JSON` `POO`
 
 ---
 
 <div align="center">
-
-### 💬 "Código limpo não é escrito seguindo regras — é escrito com cuidado."
-
-![Visitor Count](https://komarev.com/ghpvc/?username=seu-usuario&color=blue&style=flat-square)
-
-</div>
