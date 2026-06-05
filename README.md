@@ -12,29 +12,6 @@
 
 ---
 
-## 🚀 Sobre Mim
-
-```java
-public class Developer {
-
-    private String name     = "Guilherme Paiva Alves";
-    private String role     = "Back-end Developer";
-    private String location = "Brasil 🇧🇷";
-
-    private String[] focus = {
-        "APIs RESTful robustas e escaláveis",
-        "Arquitetura limpa com Design Patterns",
-        "Boas práticas de POO e SOLID"
-    };
-
-    public String getCurrentStatus() {
-        return "Sempre aprendendo e construindo 🔨";
-    }
-}
-```
-
----
-
 ## 🛠️ Tech Stack
 
 ### ☕ Linguagens
