@@ -60,28 +60,4 @@
 
 ---
 
----
-
----
-
-## 📌 Projetos em Destaque
-
-### 🔹 [screenmatch-without-web]([https://github.com/seu-usuario/projeto1](https://github.com/Guui360gpa/screenmatch-without-web-))
-> Plataforma de streaming desenvolvida em Java, que consome uma API REST.  
-> `Java` `Spring Boot` `API HTTP` `Jackson` `POO` `Maven`
-
-### 🔹 [consulta-fipe-spring]([https://github.com/seu-usuario/projeto2](https://github.com/Guui360gpa/consulta-fipe-spring))
-> Aplicação Spring Boot para conulta de preços FIPE de veículos via API REST.
-> `Java` `Design Patterns` `Maven` `Spring Boot` `API REST`
-
-### 🔹 [cripto-price-api-client]([https://github.com/Guui360gpa/crypto-price-api-client)
-> Buscar e exibir o valor atualizado de criptomoedas em tempo real integrado com API REST.
-> `Java` `Design Patterns` `Maven` `Spring Boot` `JSON`
-
-### 🔹 [smashpointlanchonete-api]([https://github.com/Guui360gpa/smashpoint-lanchonete-api-java)
-> Sistema de gerenciamento de pedidos via JSON.
-> `Java` `Design Patterns` `JSON` `POO`
-
----
-
 <div align="center">
