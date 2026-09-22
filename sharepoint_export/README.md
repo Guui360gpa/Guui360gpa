@@ -8,8 +8,11 @@ Automatiza, de ponta a ponta:
    e coloca na **Area de Trabalho**.
 4. Abre o arquivo no **Excel**, habilita a conexao de dados externos e aguarda a
    carga da base (padrao: ate 3 minutos).
-5. Aplica **AutoFit Column Width** e depois **AutoFit Row Height** na planilha inteira.
-6. Salva como **`Base Nova.xlsx`** na Area de Trabalho, pronta para uso.
+5. Aplica **AutoFit Column Width** e depois **AutoFit Row Height** na area de dados.
+6. Salva como **`Base Nova.xlsx`** na Area de Trabalho e **fecha o Excel**.
+
+A Area de Trabalho e a pasta Downloads sao descobertas pelo Windows (Known Folders),
+entao funciona mesmo com elas redirecionadas para o **OneDrive**.
 
 ## Instalacao (uma unica vez)
 
@@ -36,7 +39,7 @@ Duplo clique em:
 Rodar Automacao.bat
 ```
 
-Ao final, a `Base Nova.xlsx` fica na Area de Trabalho e o Excel permanece aberto com ela.
+Ao final, a `Base Nova.xlsx` fica na Area de Trabalho e o Excel e fechado automaticamente.
 
 ## Configuracao
 
@@ -48,9 +51,11 @@ Tudo o que muda de ambiente esta em `config.py`:
 | Rotulo do botao | `EXPORT_MENU_ITEM` |
 | Perfil do Edge | `EDGE_USER_DATA_DIR`, `EDGE_PROFILE_DIRECTORY` |
 | Usar copia do perfil | `USE_PROFILE_COPY` |
-| Espera da carga da base | `DATA_LOAD_WAIT_SECONDS` (padrao 180s) |
+| Teto da carga da base | `DATA_LOAD_TIMEOUT_SECONDS` (padrao 600s) |
+| Pastas (auto-detectadas) | `DESKTOP_DIR`, `DOWNLOADS_DIR` (None = automatico) |
+| Excel visivel durante o processo | `EXCEL_VISIBLE` (padrao False, mais rapido) |
 | Nome final do arquivo | `OUTPUT_XLSX_NAME` |
-| Manter Excel aberto | `KEEP_EXCEL_OPEN` |
+| Manter Excel aberto ao final | `KEEP_EXCEL_OPEN` (padrao False) |
 
 ### Sobre o perfil do Edge
 
@@ -81,4 +86,5 @@ Rode uma vez com calma e acompanhe a janela:
 | "Nao encontrei o item 'Export to Excel'" | Pagina abriu deslogada ou o rotulo mudou | Rode com a janela visivel, faca login; ajuste `EXPORT_MENU_ITEM` |
 | "O download nao foi concluido" | Exportacao demorou mais que o limite | Aumente `DOWNLOAD_WAIT_SECONDS` |
 | "A base nao carregou" | Excel bloqueou a conexao externa | Abra o `query.iqy` manualmente uma vez e habilite o conteudo |
+| Arquivo nao aparece no Desktop | Desktop redirecionado | Ja tratado; se preciso, fixe `DESKTOP_DIR` em `config.py` |
 | Edge nao abre | Perfil travado | Mantenha `USE_PROFILE_COPY = True` |

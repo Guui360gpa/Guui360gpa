@@ -4,12 +4,12 @@ Automatiza o fluxo completo:
 
   1. Abre o Microsoft Edge (perfil pessoal, maximizado) via Playwright.
   2. Acessa o SharePoint e clica em "Export to Excel".
-  3. Intercepta o download (nome aleatorio do Playwright), renomeia para
-     "query.iqy" e move para a Area de Trabalho.
-  4. Abre o arquivo no Excel, libera a conexao externa e aguarda a carga
-     da base (por padrao ate 3 minutos).
-  5. Aplica AutoFit de largura de coluna e de altura de linha em toda a planilha.
-  6. Salva como "Base Nova.xlsx" na Area de Trabalho.
+  3. Intercepta o download, renomeia para "query.iqy" e move para a Area de
+     Trabalho REAL (inclusive quando ela esta redirecionada para o OneDrive).
+  4. Abre o arquivo no Excel (em segundo plano), libera a conexao externa e
+     aguarda a carga da base.
+  5. Aplica AutoFit de largura de coluna e de altura de linha.
+  6. Salva como "Base Nova.xlsx" na Area de Trabalho e FECHA o Excel.
 
 Uso:
     python sharepoint_to_excel.py
@@ -34,13 +34,116 @@ import config
 # Log
 # --------------------------------------------------------------------------- #
 
+_START = time.time()
+
 
 def log(message: str) -> None:
-    print(f"[{datetime.now():%H:%M:%S}] {message}", flush=True)
+    print(f"[{datetime.now():%H:%M:%S} | +{time.time() - _START:6.1f}s] {message}",
+          flush=True)
 
 
 class AutomationError(RuntimeError):
     """Erro de negocio previsto pela automacao (mensagem amigavel)."""
+
+
+# --------------------------------------------------------------------------- #
+# Pastas reais do Windows (Desktop/Downloads podem estar no OneDrive)
+# --------------------------------------------------------------------------- #
+
+FOLDERID_DESKTOP = "{B4BFCC3A-DB2C-424C-B029-7FE99A87C641}"
+FOLDERID_DOWNLOADS = "{374DE290-123F-4565-9164-39C4925E467B}"
+
+
+def _known_folder(folder_id: str) -> Optional[str]:
+    """Consulta o caminho real da pasta especial via API do Windows."""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class GUID(ctypes.Structure):
+            _fields_ = [
+                ("Data1", ctypes.c_uint32),
+                ("Data2", ctypes.c_uint16),
+                ("Data3", ctypes.c_uint16),
+                ("Data4", ctypes.c_ubyte * 8),
+            ]
+
+        guid = GUID()
+        if ctypes.windll.ole32.CLSIDFromString(
+            ctypes.create_unicode_buffer(folder_id), ctypes.byref(guid)
+        ) != 0:
+            return None
+
+        pointer = ctypes.c_wchar_p()
+        result = ctypes.windll.shell32.SHGetKnownFolderPath(
+            ctypes.byref(guid), 0, wintypes.HANDLE(0), ctypes.byref(pointer)
+        )
+        if result != 0 or not pointer.value:
+            return None
+        path = pointer.value
+        ctypes.windll.ole32.CoTaskMemFree(pointer)
+        return path
+    except Exception:
+        return None
+
+
+def _shell_folder_from_registry(value_name: str) -> Optional[str]:
+    """Plano B: le a pasta especial no registro do usuario."""
+    if os.name != "nt":
+        return None
+    try:
+        import winreg
+
+        key_path = (r"Software\Microsoft\Windows\CurrentVersion"
+                    r"\Explorer\User Shell Folders")
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path) as key:
+            raw, _ = winreg.QueryValueEx(key, value_name)
+        return os.path.expandvars(raw)
+    except Exception:
+        return None
+
+
+def _resolve_folder(configured: Optional[str], folder_id: str,
+                    registry_name: str, fallback_name: str, label: str) -> str:
+    """
+    Descobre a pasta real (Desktop/Downloads), nesta ordem:
+    config.py -> API do Windows -> registro -> OneDrive -> %USERPROFILE%.
+    """
+    if configured:
+        return os.path.abspath(os.path.expandvars(configured))
+
+    for candidate in (
+        _known_folder(folder_id),
+        _shell_folder_from_registry(registry_name),
+        os.path.join(os.environ.get("OneDriveCommercial", "") or
+                     os.environ.get("OneDrive", "") or "\x00", fallback_name),
+        os.path.join(os.path.expanduser("~"), fallback_name),
+    ):
+        if candidate and "\x00" not in candidate and os.path.isdir(candidate):
+            return os.path.abspath(candidate)
+
+    # Ultimo recurso: cria dentro do perfil do usuario.
+    fallback = os.path.join(os.path.expanduser("~"), fallback_name)
+    os.makedirs(fallback, exist_ok=True)
+    log(f"AVISO: nao consegui detectar a pasta '{label}'. Usando: {fallback}")
+    return fallback
+
+
+def get_desktop_dir() -> str:
+    return _resolve_folder(getattr(config, "DESKTOP_DIR", None),
+                           FOLDERID_DESKTOP, "Desktop", "Desktop", "Desktop")
+
+
+def get_downloads_dir() -> str:
+    return _resolve_folder(getattr(config, "DOWNLOADS_DIR", None),
+                           FOLDERID_DOWNLOADS, "{374DE290-123F-4565-9164-39C4925E467B}",
+                           "Downloads", "Downloads")
+
+
+DESKTOP_DIR = ""
+DOWNLOADS_DIR = ""
 
 
 # --------------------------------------------------------------------------- #
@@ -61,17 +164,13 @@ def edge_is_running() -> bool:
     try:
         output = subprocess.run(
             ["tasklist", "/FI", "IMAGENAME eq msedge.exe", "/NH"],
-            capture_output=True,
-            text=True,
-            timeout=30,
+            capture_output=True, text=True, timeout=30,
         ).stdout.lower()
     except Exception:
         return False
     return "msedge.exe" in output
 
 
-# Pastas/arquivos que nunca precisam ser copiados (cache pesado e estado de
-# sessao que o Edge mantem travado enquanto esta aberto).
 PROFILE_SKIP_NAMES = {
     "cache", "code cache", "gpucache", "dawncache", "shadercache",
     "grshadercache", "media cache", "service worker", "crashpad",
@@ -80,7 +179,7 @@ PROFILE_SKIP_NAMES = {
 }
 
 
-def _copy_profile_tolerant(src: str, dst: str) -> tuple[int, int]:
+def _copy_profile_tolerant(src: str, dst: str):
     """
     Copia o perfil do Edge ignorando o que estiver travado por outro processo.
 
@@ -108,19 +207,27 @@ def _copy_profile_tolerant(src: str, dst: str) -> tuple[int, int]:
                              os.path.join(destination_root, name))
                 copied += 1
             except (OSError, shutil.Error):
-                # Arquivo em uso pelo Edge: segue o jogo.
-                skipped += 1
+                skipped += 1  # arquivo em uso pelo Edge: segue o jogo
     return copied, skipped
+
+
+def _clear_profile_locks(destination: str) -> None:
+    """Remove travas remanescentes da copia do perfil."""
+    for lock in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+        lock_path = os.path.join(destination, lock)
+        if os.path.exists(lock_path):
+            try:
+                os.remove(lock_path)
+            except OSError:
+                pass
 
 
 def prepare_profile_dir() -> str:
     """
     Devolve o diretorio de perfil que sera usado pelo Playwright.
 
-    O Edge nao permite que dois processos usem o mesmo 'User Data' ao mesmo
-    tempo. Por isso, por padrao, trabalhamos sobre uma copia do perfil. A copia
-    e criada uma unica vez (marcador '.profile_seeded'); dali em diante ela tem
-    a propria sessao logada e nao precisa mais ser sincronizada.
+    A copia e criada uma unica vez (marcador '.profile_seeded'); dali em diante
+    ela tem a propria sessao logada e nao precisa mais ser sincronizada.
     """
     source = config.EDGE_USER_DATA_DIR
     if not source or not os.path.isdir(source):
@@ -141,7 +248,6 @@ def prepare_profile_dir() -> str:
 
     destination = config.PROFILE_COPY_DIR
     profile = config.EDGE_PROFILE_DIRECTORY
-
     src_profile = os.path.join(source, profile)
     dst_profile = os.path.join(destination, profile)
     marker = os.path.join(destination, ".profile_seeded")
@@ -152,15 +258,12 @@ def prepare_profile_dir() -> str:
             "Ajuste EDGE_PROFILE_DIRECTORY em config.py."
         )
 
-    already_seeded = os.path.isfile(marker) and os.path.isdir(dst_profile)
-    if already_seeded and not getattr(config, "PROFILE_RESYNC_EACH_RUN", False):
-        log("Usando a copia de perfil ja existente.")
+    if (os.path.isfile(marker) and os.path.isdir(dst_profile)
+            and not getattr(config, "PROFILE_RESYNC_EACH_RUN", False)):
         _clear_profile_locks(destination)
         return destination
 
     os.makedirs(destination, exist_ok=True)
-
-    # Arquivos de estado global do Edge (necessarios para o perfil abrir).
     for name in ("Local State", "Last Version"):
         src_file = os.path.join(source, name)
         if os.path.isfile(src_file):
@@ -169,7 +272,7 @@ def prepare_profile_dir() -> str:
             except OSError:
                 pass
 
-    log(f"Preparando copia do perfil do Edge ('{profile}')... pode demorar na 1a vez.")
+    log(f"Preparando copia do perfil do Edge ('{profile}')... so acontece na 1a vez.")
     copied, skipped = _copy_profile_tolerant(src_profile, dst_profile)
     log(f"Perfil copiado: {copied} arquivos ({skipped} ignorados por estarem em uso).")
     if skipped:
@@ -177,99 +280,75 @@ def prepare_profile_dir() -> str:
             "a sessao fica salva na copia e as proximas execucoes rodam sozinhas.")
 
     _clear_profile_locks(destination)
-
     try:
         with open(marker, "w", encoding="utf-8") as handle:
             handle.write(datetime.now().isoformat())
     except OSError:
         pass
-
     return destination
 
 
-def _clear_profile_locks(destination: str) -> None:
-    """Remove travas remanescentes da copia do perfil."""
-    for lock in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
-        lock_path = os.path.join(destination, lock)
-        if os.path.exists(lock_path):
-            try:
-                os.remove(lock_path)
-            except OSError:
-                pass
-
-
 # --------------------------------------------------------------------------- #
-# Etapa 1 e 2 - Playwright / SharePoint
+# Etapas 1 a 3 - Playwright / SharePoint
 # --------------------------------------------------------------------------- #
 
 
 def _snapshot_downloads() -> set:
     """Fotografa a pasta Downloads para detectar arquivos novos depois."""
     try:
-        return set(os.listdir(config.DOWNLOADS_DIR))
+        return set(os.listdir(DOWNLOADS_DIR))
     except OSError:
         return set()
 
 
-def _find_new_download(before: set, deadline: float) -> Optional[str]:
+def _new_finished_download(before: set) -> Optional[str]:
     """
-    Vigia a pasta Downloads e devolve o caminho do primeiro arquivo novo,
-    ja finalizado (sem .crdownload / .tmp / .partial).
+    Devolve o arquivo novo e ja finalizado na pasta Downloads, ou None.
+    Consulta unica (sem bloquear): quem chama decide o ritmo do polling.
     """
-    while time.time() < deadline:
-        try:
-            current = set(os.listdir(config.DOWNLOADS_DIR))
-        except OSError:
-            current = set()
-
-        candidates = []
-        for name in current - before:
-            lowered = name.lower()
-            if lowered.endswith((".crdownload", ".tmp", ".partial")):
-                continue
-            if not lowered.endswith(config.ACCEPTED_DOWNLOAD_SUFFIXES):
-                continue
-            candidates.append(os.path.join(config.DOWNLOADS_DIR, name))
-
-        if candidates:
-            newest = max(candidates, key=os.path.getmtime)
-            if _file_is_stable(newest):
-                return newest
-
-        time.sleep(0.5)
-    return None
-
-
-def _file_is_stable(path: str, checks: int = 3, interval: float = 0.4) -> bool:
-    """Confirma que o arquivo parou de crescer (download concluido)."""
     try:
-        last = os.path.getsize(path)
+        current = set(os.listdir(DOWNLOADS_DIR))
+    except OSError:
+        return None
+
+    candidates = []
+    for name in current - before:
+        lowered = name.lower()
+        if lowered.endswith((".crdownload", ".tmp", ".partial")):
+            continue
+        if not lowered.endswith(config.ACCEPTED_DOWNLOAD_SUFFIXES):
+            continue
+        candidates.append(os.path.join(DOWNLOADS_DIR, name))
+
+    if not candidates:
+        return None
+
+    newest = max(candidates, key=os.path.getmtime)
+    return newest if _file_is_stable(newest) else None
+
+
+def _file_is_stable(path: str) -> bool:
+    """Confirma rapidamente que o arquivo parou de crescer."""
+    try:
+        first = os.path.getsize(path)
+        time.sleep(0.2)
+        return first == os.path.getsize(path)
     except OSError:
         return False
-    for _ in range(checks):
-        time.sleep(interval)
-        try:
-            size = os.path.getsize(path)
-        except OSError:
-            return False
-        if size != last:
-            last = size
-            continue
-    return True
 
 
 def download_export_file() -> str:
     """
-    Executa o fluxo no SharePoint e devolve o caminho do arquivo baixado
+    Executa o fluxo no SharePoint e devolve o caminho do arquivo baixado,
     ja renomeado para 'query.iqy' na Area de Trabalho.
     """
     from playwright.sync_api import sync_playwright
 
     user_data_dir = prepare_profile_dir()
-    os.makedirs(config.DESKTOP_DIR, exist_ok=True)
+    os.makedirs(DESKTOP_DIR, exist_ok=True)
 
-    target_path = os.path.join(config.DESKTOP_DIR, config.IQY_FILENAME)
-    captured: dict[str, str] = {}
+    target_path = os.path.join(DESKTOP_DIR, config.IQY_FILENAME)
+    captured: dict = {}
     before = _snapshot_downloads()
 
     with sync_playwright() as playwright:
@@ -279,7 +358,7 @@ def download_export_file() -> str:
             channel=config.BROWSER_CHANNEL,
             headless=False,
             accept_downloads=True,
-            downloads_path=config.DOWNLOADS_DIR,
+            downloads_path=DOWNLOADS_DIR,
             no_viewport=True,  # necessario para a janela ficar realmente maximizada
             args=[
                 "--start-maximized",
@@ -295,14 +374,13 @@ def download_export_file() -> str:
             if "path" in captured:
                 return
             try:
-                suggested = download.suggested_filename
-                log(f"Download interceptado: {suggested}")
+                log(f"Download interceptado: {download.suggested_filename}")
                 download.save_as(target_path)
                 captured["path"] = target_path
                 log(f"Salvo como: {target_path}")
-            except Exception as exc:  # pragma: no cover - depende do ambiente
-                log(f"Nao foi possivel salvar direto pelo Playwright ({exc}). "
-                    "Vou vigiar a pasta Downloads.")
+            except Exception as exc:
+                log(f"Nao foi possivel salvar pelo Playwright ({exc}). "
+                    "Vou pegar o arquivo na pasta Downloads.")
 
         context.on("download", handle_download)
 
@@ -310,16 +388,13 @@ def download_export_file() -> str:
         page.set_default_timeout(config.PAGE_LOAD_TIMEOUT_MS)
 
         log(f"Acessando: {config.SHAREPOINT_URL}")
+        # 'domcontentloaded' basta: o SharePoint mantem conexoes abertas e
+        # nunca atinge 'networkidle' - esperar por isso so queimava tempo.
         page.goto(config.SHAREPOINT_URL, wait_until="domcontentloaded",
                   timeout=config.PAGE_LOAD_TIMEOUT_MS)
-        try:
-            page.wait_for_load_state("networkidle", timeout=45_000)
-        except Exception:
-            pass  # o SharePoint mantem conexoes abertas; seguir em frente
 
-        log(f"Procurando o menu '{config.EXPORT_MENU_ITEM}'...")
-        clicked = _click_export(page)
-        if not clicked:
+        log(f"Procurando '{config.EXPORT_MENU_ITEM}' (clica assim que aparecer)...")
+        if not _click_export(page):
             raise AutomationError(
                 f"Nao encontrei o item '{config.EXPORT_MENU_ITEM}' na pagina. "
                 "Confirme se a pagina carregou logada e se o nome do botao mudou."
@@ -328,6 +403,14 @@ def download_export_file() -> str:
         log("Aguardando o arquivo exportado...")
         deadline = time.time() + config.DOWNLOAD_WAIT_SECONDS
         while time.time() < deadline and "path" not in captured:
+            # Plano B em paralelo: o Edge pode baixar direto para Downloads,
+            # sem disparar o evento do Playwright.
+            found = _new_finished_download(before)
+            if found:
+                log(f"Arquivo novo em Downloads: {os.path.basename(found)}")
+                captured["path"] = _move_to_desktop(found, target_path)
+                break
+
             # Fecha popups vazios que o SharePoint abre so para disparar o download.
             for extra in list(context.pages)[1:]:
                 try:
@@ -335,14 +418,7 @@ def download_export_file() -> str:
                         extra.close()
                 except Exception:
                     pass
-            time.sleep(0.5)
-
-        if "path" not in captured:
-            # Plano B: o Edge pode ter baixado direto para a pasta Downloads.
-            found = _find_new_download(before, time.time() + 30)
-            if found:
-                log(f"Arquivo novo detectado em Downloads: {os.path.basename(found)}")
-                captured["path"] = _move_to_desktop(found, target_path)
+            time.sleep(0.25)
 
         if not config.KEEP_BROWSER_OPEN:
             try:
@@ -360,69 +436,67 @@ def download_export_file() -> str:
 
 def _click_export(page) -> bool:
     """
-    Clica em 'Export to Excel'. Tenta varias estrategias porque o SharePoint
-    renderiza o comando ora como menuitem, ora como botao, as vezes dentro
-    do menu 'Export' ou do overflow ('...').
+    Clica em 'Export to Excel' assim que ele existir.
+
+    Em vez de tentar cada estrategia com um timeout longo (o que somava dezenas
+    de segundos), varre todas as estrategias em ciclos rapidos ate o teto de
+    EXPORT_SEARCH_SECONDS.
     """
     name = config.EXPORT_MENU_ITEM
+    deadline = time.time() + config.EXPORT_SEARCH_SECONDS
+    openers_tried = False
+
+    def candidates():
+        yield page.get_by_role("menuitem", name=name), "menuitem"
+        yield page.get_by_role("button", name=name), "button"
+        yield page.get_by_role("link", name=name), "link"
+        yield page.get_by_text(name, exact=False), "texto"
+        for frame in page.frames:
+            if frame is page.main_frame:
+                continue
+            yield frame.get_by_role("menuitem", name=name), "menuitem (iframe)"
+            yield frame.get_by_role("button", name=name), "button (iframe)"
+            yield frame.get_by_text(name, exact=False), "texto (iframe)"
 
     def try_click(locator, description: str) -> bool:
         try:
             if locator.count() == 0:
                 return False
             target = locator.first
-            target.wait_for(state="visible", timeout=10_000)
-            target.scroll_into_view_if_needed(timeout=5_000)
-            target.click(timeout=15_000)
+            if not target.is_visible():
+                return False
+            target.scroll_into_view_if_needed(timeout=3_000)
+            target.click(timeout=8_000)
             log(f"Clique efetuado em: {description}")
             return True
         except Exception:
             return False
 
-    # 1) Caminho direto (igual ao gravado pelo codegen).
-    if try_click(page.get_by_role("menuitem", name=name), "menuitem 'Export to Excel'"):
-        return True
-
-    # 2) Abrir menus intermediarios e tentar de novo.
-    for opener in ("Export", "More options", "More", "..."):
-        try:
-            button = page.get_by_role("button", name=opener, exact=False)
-            if button.count():
-                button.first.click(timeout=8_000)
-                page.wait_for_timeout(1_200)
-                if try_click(page.get_by_role("menuitem", name=name),
-                             f"menuitem apos abrir '{opener}'"):
-                    return True
-        except Exception:
-            continue
-
-    # 3) Botao/link com o mesmo rotulo.
-    for locator, description in (
-        (page.get_by_role("button", name=name), "button 'Export to Excel'"),
-        (page.get_by_role("link", name=name), "link 'Export to Excel'"),
-        (page.get_by_text(name, exact=False), "texto 'Export to Excel'"),
-    ):
-        if try_click(locator, description):
-            return True
-
-    # 4) Dentro de iframes (web parts classicas).
-    for frame in page.frames:
-        if frame is page.main_frame:
-            continue
-        for locator, description in (
-            (frame.get_by_role("menuitem", name=name), "menuitem (iframe)"),
-            (frame.get_by_role("button", name=name), "button (iframe)"),
-            (frame.get_by_text(name, exact=False), "texto (iframe)"),
-        ):
+    while time.time() < deadline:
+        for locator, description in candidates():
             if try_click(locator, description):
                 return True
+
+        # Depois de alguns ciclos sem achar, abre os menus que podem escondê-lo.
+        if not openers_tried and time.time() > deadline - config.EXPORT_SEARCH_SECONDS + 6:
+            openers_tried = True
+            for opener in ("Export", "More options", "More", "..."):
+                try:
+                    button = page.get_by_role("button", name=opener, exact=False)
+                    if button.count() and button.first.is_visible():
+                        button.first.click(timeout=5_000)
+                        page.wait_for_timeout(600)
+                except Exception:
+                    continue
+
+        page.wait_for_timeout(300)
 
     return False
 
 
 def _move_to_desktop(source: str, target_path: str) -> str:
     """Move o arquivo baixado para a Area de Trabalho com o nome definitivo."""
-    os.makedirs(config.DESKTOP_DIR, exist_ok=True)
+    os.makedirs(os.path.dirname(target_path), exist_ok=True)
     if os.path.exists(target_path):
         os.remove(target_path)
     shutil.move(source, target_path)
@@ -431,19 +505,21 @@ def _move_to_desktop(source: str, target_path: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Etapas 4, 5 e 6 - Excel
+# Etapas 4 a 6 - Excel
 # --------------------------------------------------------------------------- #
 
 XL_OPENXML_WORKBOOK = 51          # xlOpenXMLWorkbook (.xlsx)
+XL_CALCULATION_MANUAL = -4135
+XL_CALCULATION_AUTOMATIC = -4105
 MSO_AUTOMATION_SECURITY_LOW = 1   # msoAutomationSecurityLow
 
 
 def process_in_excel(iqy_path: str) -> str:
-    """Abre o .iqy, aguarda a carga, aplica AutoFit e salva como .xlsx."""
+    """Abre o .iqy, aguarda a carga, aplica AutoFit, salva como .xlsx e fecha."""
     import pythoncom
     import win32com.client as win32
 
-    output_path = os.path.join(config.DESKTOP_DIR, config.OUTPUT_XLSX_NAME)
+    output_path = os.path.join(DESKTOP_DIR, config.OUTPUT_XLSX_NAME)
 
     pythoncom.CoInitialize()
     excel = None
@@ -451,68 +527,115 @@ def process_in_excel(iqy_path: str) -> str:
     try:
         log("Abrindo o Microsoft Excel...")
         excel = win32.DispatchEx("Excel.Application")
-        excel.Visible = True
+        # Excel invisivel e sem redesenho: a carga e o AutoFit ficam MUITO
+        # mais rapidos, porque o Excel nao gasta tempo pintando a tela.
+        excel.Visible = bool(getattr(config, "EXCEL_VISIBLE", False))
         excel.DisplayAlerts = False
         excel.AskToUpdateLinks = False
+        excel.ScreenUpdating = False
         try:
-            excel.AutomationSecurity = MSO_AUTOMATION_SECURITY_LOW
+            excel.EnableEvents = False
         except Exception:
             pass
         try:
-            excel.WindowState = -4137  # xlMaximized
+            excel.AutomationSecurity = MSO_AUTOMATION_SECURITY_LOW
         except Exception:
             pass
 
         log(f"Abrindo a base: {os.path.basename(iqy_path)}")
         workbook = excel.Workbooks.Open(os.path.abspath(iqy_path))
 
-        _enable_and_refresh_connections(excel, workbook)
-        _wait_for_data(excel, workbook)
-        _autofit_all(workbook)
+        try:
+            excel.Calculation = XL_CALCULATION_MANUAL
+        except Exception:
+            pass
+
+        _load_data(excel, workbook)
+        _autofit_used_range(workbook)
+
+        try:
+            excel.Calculation = XL_CALCULATION_AUTOMATIC
+        except Exception:
+            pass
 
         if os.path.exists(output_path):
             log("Removendo versao anterior de 'Base Nova.xlsx'...")
-            os.remove(output_path)
+            try:
+                os.remove(output_path)
+            except OSError as exc:
+                raise AutomationError(
+                    f"Nao consegui substituir '{output_path}': {exc}\n"
+                    "O arquivo provavelmente esta aberto no Excel. Feche-o e rode de novo."
+                )
 
         log(f"Salvando como: {output_path}")
         workbook.SaveAs(output_path, FileFormat=XL_OPENXML_WORKBOOK)
+        log("Salvo com sucesso.")
 
-        if not config.KEEP_EXCEL_OPEN:
-            workbook.Close(SaveChanges=False)
-            excel.Quit()
-        else:
-            excel.DisplayAlerts = True
-            excel.Visible = True
+        if not os.path.exists(output_path):
+            raise AutomationError(
+                f"O Excel nao gravou o arquivo em: {output_path}\n"
+                "Verifique permissoes/sincronizacao do OneDrive nessa pasta."
+            )
 
         return output_path
-    except Exception:
-        # Em caso de falha, nao deixa instancias fantasma do Excel abertas.
-        try:
-            if workbook is not None and not config.KEEP_EXCEL_OPEN:
-                workbook.Close(SaveChanges=False)
-        except Exception:
-            pass
-        try:
-            if excel is not None and not config.KEEP_EXCEL_OPEN:
-                excel.Quit()
-        except Exception:
-            pass
-        raise
     finally:
+        _shutdown_excel(excel, workbook)
         pythoncom.CoUninitialize()
 
 
-def _enable_and_refresh_connections(excel, workbook) -> None:
+def _shutdown_excel(excel, workbook) -> None:
+    """Fecha a pasta de trabalho e encerra o Excel (a nao ser que configurado)."""
+    keep_open = bool(getattr(config, "KEEP_EXCEL_OPEN", False))
+    try:
+        if excel is not None:
+            excel.ScreenUpdating = True
+            excel.DisplayAlerts = True
+            try:
+                excel.EnableEvents = True
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    if keep_open:
+        try:
+            if excel is not None:
+                excel.Visible = True
+        except Exception:
+            pass
+        return
+
+    try:
+        if workbook is not None:
+            workbook.Close(SaveChanges=False)
+            log("Pasta de trabalho fechada.")
+    except Exception:
+        pass
+    try:
+        if excel is not None:
+            excel.Quit()
+            log("Excel encerrado.")
+    except Exception:
+        pass
+
+
+def _load_data(excel, workbook) -> None:
     """
-    Libera as conexoes de dados externos (o equivalente a clicar em
-    'Habilitar conteudo' / 'Enable external data') e dispara a atualizacao
-    em primeiro plano, para conseguirmos aguardar de forma confiavel.
+    Libera a conexao externa e carrega a base.
+
+    A atualizacao e feita em PRIMEIRO PLANO (BackgroundQuery=False): a chamada
+    so retorna quando os dados chegaram, entao nao ha espera fixa nenhuma -
+    assim que a query termina, o script segue.
     """
     try:
         workbook.EnableConnections()
         log("Conexoes de dados externos habilitadas.")
     except Exception:
         pass  # algumas versoes ja abrem habilitado e lancam erro aqui
+
+    started = time.time()
+    log("Carregando a base (o script segue assim que a query terminar)...")
 
     refreshed = False
     for sheet in workbook.Worksheets:
@@ -525,56 +648,37 @@ def _enable_and_refresh_connections(excel, workbook) -> None:
                 except Exception:
                     pass
                 try:
-                    query_table.Refresh(BackgroundQuery=False)
+                    query_table.Refresh(BackgroundQuery=False)  # sincrono
                     refreshed = True
-                except Exception:
-                    pass
+                except Exception as exc:
+                    log(f"  aviso na atualizacao da query: {exc}")
         except Exception:
             continue
 
     if not refreshed:
         try:
             workbook.RefreshAll()
-            log("RefreshAll disparado.")
         except Exception:
             pass
 
-
-def _wait_for_data(excel, workbook) -> None:
-    """
-    Aguarda a base carregar. Comeca pela espera fixa configurada (3 min por
-    padrao) e, se a query ainda estiver atualizando, concede uma folga extra.
-    """
-    total = config.DATA_LOAD_WAIT_SECONDS
-    log(f"Aguardando a carga da base (ate {total // 60} min {total % 60}s)...")
-
-    deadline = time.time() + total
-    while time.time() < deadline:
-        if not _is_refreshing(workbook) and _has_data(workbook):
-            # Pequena estabilizacao antes de formatar.
-            time.sleep(3)
-            if not _is_refreshing(workbook):
-                log("Base carregada.")
-                break
-        time.sleep(2)
-    else:
-        log("Tempo padrao esgotado; verificando se a query ainda esta rodando...")
-
-    grace_deadline = time.time() + config.DATA_LOAD_EXTRA_GRACE_SECONDS
-    while _is_refreshing(workbook) and time.time() < grace_deadline:
-        time.sleep(3)
+    # Se sobrou alguma query em segundo plano, espera terminar (com teto).
+    deadline = time.time() + config.DATA_LOAD_TIMEOUT_SECONDS
+    while _is_refreshing(workbook) and time.time() < deadline:
+        time.sleep(1)
 
     try:
         excel.CalculateUntilAsyncQueriesDone()
     except Exception:
         pass
 
-    if not _has_data(workbook):
+    rows = _used_rows(workbook)
+    if rows <= 1:
         raise AutomationError(
             "A base nao carregou: a planilha continua vazia. "
             "Abra o 'query.iqy' manualmente uma vez para validar o acesso "
             "ao SharePoint pelo Excel e rode o script de novo."
         )
+    log(f"Base carregada: {rows} linhas em {time.time() - started:.0f}s.")
 
 
 def _is_refreshing(workbook) -> bool:
@@ -589,37 +693,36 @@ def _is_refreshing(workbook) -> bool:
     return False
 
 
-def _has_data(workbook) -> bool:
-    """Considera carregada quando ha mais de uma linha preenchida."""
+def _used_rows(workbook) -> int:
     try:
-        sheet = workbook.Worksheets(1)
-        used = sheet.UsedRange
-        return used.Rows.Count > 1 and used.Columns.Count >= 1 and \
-            str(sheet.Cells(1, 1).Value or "").strip() != ""
+        return int(workbook.Worksheets(1).UsedRange.Rows.Count)
     except Exception:
-        return False
+        return 0
 
 
-def _autofit_all(workbook) -> None:
-    """Ctrl+A > Format > AutoFit Column Width e, depois, AutoFit Row Height."""
+def _autofit_used_range(workbook) -> None:
+    """
+    Ctrl+A > Format > AutoFit Column Width e depois AutoFit Row Height.
+
+    Aplicado sobre o UsedRange (a area que realmente tem dados). Rodar sobre
+    Cells inteiro faria o Excel avaliar 16.384 colunas x 1.048.576 linhas -
+    era isso que fazia a etapa levar varios minutos. O resultado visual e o
+    mesmo, porque fora do UsedRange nao ha conteudo para ajustar.
+    """
     for sheet in workbook.Worksheets:
         try:
-            sheet.Activate()
-        except Exception:
-            pass
-        try:
-            log(f"AutoFit de largura das colunas em '{sheet.Name}'...")
-            sheet.Cells.EntireColumn.AutoFit()
+            used = sheet.UsedRange
+            started = time.time()
+            used.EntireColumn.AutoFit()
+            used.EntireRow.AutoFit()
+            log(f"AutoFit aplicado em '{sheet.Name}' "
+                f"({used.Rows.Count} x {used.Columns.Count}) "
+                f"em {time.time() - started:.0f}s.")
         except Exception as exc:
-            log(f"  aviso: nao foi possivel ajustar colunas ({exc})")
-        try:
-            log(f"AutoFit de altura das linhas em '{sheet.Name}'...")
-            sheet.Cells.EntireRow.AutoFit()
-        except Exception as exc:
-            log(f"  aviso: nao foi possivel ajustar linhas ({exc})")
+            log(f"  aviso: AutoFit falhou em '{sheet.Name}' ({exc})")
+
     try:
         workbook.Worksheets(1).Activate()
-        workbook.Worksheets(1).Range("A1").Select()
     except Exception:
         pass
 
@@ -630,28 +733,41 @@ def _autofit_all(workbook) -> None:
 
 
 def main() -> int:
-    log("=" * 68)
+    global DESKTOP_DIR, DOWNLOADS_DIR
+
+    log("=" * 70)
     log("SharePoint -> Excel | inicio")
-    log("=" * 68)
     try:
         ensure_windows()
 
-        iqy_path = download_export_file()
+        DESKTOP_DIR = get_desktop_dir()
+        DOWNLOADS_DIR = get_downloads_dir()
+        log(f"Area de Trabalho: {DESKTOP_DIR}")
+        log(f"Downloads.......: {DOWNLOADS_DIR}")
 
+        iqy_path = download_export_file()
         if not os.path.isfile(iqy_path):
             raise AutomationError(f"Arquivo esperado nao existe: {iqy_path}")
 
         output = process_in_excel(iqy_path)
 
-        log("=" * 68)
-        log(f"CONCLUIDO! Arquivo pronto em: {output}")
-        log("=" * 68)
+        if getattr(config, "DELETE_IQY_AFTER", False):
+            try:
+                os.remove(iqy_path)
+                log("Arquivo 'query.iqy' removido.")
+            except OSError:
+                pass
+
+        log("=" * 70)
+        log(f"CONCLUIDO em {time.time() - _START:.0f}s! Arquivo pronto em:")
+        log(f"  {output}")
+        log("=" * 70)
         return 0
     except AutomationError as exc:
         log("")
         log("FALHOU: " + str(exc))
         return 1
-    except Exception as exc:  # pragma: no cover
+    except Exception as exc:
         log("")
         log(f"ERRO INESPERADO: {exc}")
         traceback.print_exc()
