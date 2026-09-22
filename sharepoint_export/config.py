@@ -55,12 +55,24 @@ OUTPUT_XLSX_NAME = "Base Nova.xlsx"
 ACCEPTED_DOWNLOAD_SUFFIXES = (".iqy", ".xlsx", ".xls", ".csv")
 
 # --------------------------------------------------------------------------- #
-# Tempos (segundos)
+# Tempos do navegador (segundos)
 # --------------------------------------------------------------------------- #
-PAGE_LOAD_TIMEOUT_MS = 90_000     # teto para a pagina do SharePoint responder
-EXPORT_SEARCH_SECONDS = 60        # teto para achar o botao (sai assim que aparece)
-DOWNLOAD_WAIT_SECONDS = 120       # teto para o arquivo chegar (sai assim que chega)
-DATA_LOAD_TIMEOUT_SECONDS = 600   # teto para a carga da base (sai assim que carrega)
+# Esta etapa e a mais fragil (SharePoint lento, Edge travando), entao trabalha
+# com folga. Todos os valores sao TETOS: o script segue assim que der certo.
+PAGE_LOAD_TIMEOUT_MS = 180_000     # teto para a pagina do SharePoint responder
+PAGE_SETTLE_SECONDS = 8            # respiro apos carregar, antes de mexer na pagina
+EXPORT_SEARCH_SECONDS = 150        # teto para achar o botao "Export to Excel"
+DOWNLOAD_WAIT_SECONDS = 240        # teto para o arquivo chegar apos o clique
+RETRY_CLICK_AFTER_SECONDS = 50     # sem download nesse tempo? clica de novo
+EXPORT_CLICK_ATTEMPTS = 3          # quantas vezes re-clicar no "Export to Excel"
+BROWSER_ATTEMPTS = 3               # se o Edge travar/crashar, reabre do zero
+BROWSER_RETRY_PAUSE_SECONDS = 6    # pausa entre uma tentativa e outra
+SLOW_MO_MS = 120                   # freia um pouco os cliques (mais estavel)
+
+# --------------------------------------------------------------------------- #
+# Tempos do Excel (segundos)
+# --------------------------------------------------------------------------- #
+DATA_LOAD_TIMEOUT_SECONDS = 600    # teto para a carga da base (sai assim que carrega)
 
 # --------------------------------------------------------------------------- #
 # Comportamento

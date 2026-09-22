@@ -328,20 +328,51 @@ def _new_finished_download(before: set) -> Optional[str]:
 
 
 def _file_is_stable(path: str) -> bool:
-    """Confirma rapidamente que o arquivo parou de crescer."""
+    """Confirma que o arquivo parou de crescer (download concluido)."""
     try:
-        first = os.path.getsize(path)
-        time.sleep(0.2)
-        return first == os.path.getsize(path)
+        size = os.path.getsize(path)
+        for _ in range(2):
+            time.sleep(0.4)
+            current = os.path.getsize(path)
+            if current != size:
+                return False
+            size = current
+        return True
     except OSError:
         return False
 
 
 def download_export_file() -> str:
     """
-    Executa o fluxo no SharePoint e devolve o caminho do arquivo baixado,
-    ja renomeado para 'query.iqy' na Area de Trabalho.
+    Executa o fluxo no SharePoint e devolve o caminho do 'query.iqy' na Area
+    de Trabalho. Se o Edge travar ou fechar sozinho, reabre e tenta de novo.
     """
+    attempts = max(1, int(getattr(config, "BROWSER_ATTEMPTS", 3)))
+    last_error: Optional[Exception] = None
+
+    for attempt in range(1, attempts + 1):
+        if attempt > 1:
+            pause = getattr(config, "BROWSER_RETRY_PAUSE_SECONDS", 6)
+            log(f"Reiniciando o navegador (tentativa {attempt} de {attempts}) "
+                f"apos {pause}s...")
+            time.sleep(pause)
+        try:
+            return _download_once()
+        except AutomationError:
+            raise  # erro de negocio: repetir nao ajuda
+        except Exception as exc:
+            # Tipicamente o Edge caiu no meio do caminho.
+            last_error = exc
+            log(f"A sessao do navegador falhou: {exc}")
+
+    raise AutomationError(
+        "O navegador nao completou a exportacao apos "
+        f"{attempts} tentativas. Ultimo erro: {last_error}"
+    )
+
+
+def _download_once() -> str:
+    """Uma tentativa completa: abre o Edge, clica, espera o arquivo."""
     from playwright.sync_api import sync_playwright
 
     user_data_dir = prepare_profile_dir()
@@ -360,12 +391,17 @@ def download_export_file() -> str:
             accept_downloads=True,
             downloads_path=DOWNLOADS_DIR,
             no_viewport=True,  # necessario para a janela ficar realmente maximizada
+            slow_mo=int(getattr(config, "SLOW_MO_MS", 0)),
             args=[
                 "--start-maximized",
                 f"--profile-directory={config.EDGE_PROFILE_DIRECTORY}",
                 "--no-first-run",
                 "--no-default-browser-check",
                 "--disable-features=msEdgeIdentityRefresh",
+                # Evita que o Edge "hiberne" a aba e derrube o download.
+                "--disable-background-timer-throttling",
+                "--disable-renderer-backgrounding",
+                "--disable-backgrounding-occluded-windows",
             ],
         )
 
@@ -384,66 +420,110 @@ def download_export_file() -> str:
 
         context.on("download", handle_download)
 
-        page = context.pages[0] if context.pages else context.new_page()
-        page.set_default_timeout(config.PAGE_LOAD_TIMEOUT_MS)
+        try:
+            page = context.pages[0] if context.pages else context.new_page()
+            page.set_default_timeout(config.PAGE_LOAD_TIMEOUT_MS)
 
-        log(f"Acessando: {config.SHAREPOINT_URL}")
-        # 'domcontentloaded' basta: o SharePoint mantem conexoes abertas e
-        # nunca atinge 'networkidle' - esperar por isso so queimava tempo.
-        page.goto(config.SHAREPOINT_URL, wait_until="domcontentloaded",
-                  timeout=config.PAGE_LOAD_TIMEOUT_MS)
+            log(f"Acessando: {config.SHAREPOINT_URL}")
+            # 'domcontentloaded' basta para seguir; o SharePoint mantem conexoes
+            # abertas e nunca atinge 'networkidle'.
+            page.goto(config.SHAREPOINT_URL, wait_until="domcontentloaded",
+                      timeout=config.PAGE_LOAD_TIMEOUT_MS)
 
-        log(f"Procurando '{config.EXPORT_MENU_ITEM}' (clica assim que aparecer)...")
-        if not _click_export(page):
-            raise AutomationError(
-                f"Nao encontrei o item '{config.EXPORT_MENU_ITEM}' na pagina. "
-                "Confirme se a pagina carregou logada e se o nome do botao mudou."
-            )
-
-        log("Aguardando o arquivo exportado...")
-        deadline = time.time() + config.DOWNLOAD_WAIT_SECONDS
-        while time.time() < deadline and "path" not in captured:
-            # Plano B em paralelo: o Edge pode baixar direto para Downloads,
-            # sem disparar o evento do Playwright.
-            found = _new_finished_download(before)
-            if found:
-                log(f"Arquivo novo em Downloads: {os.path.basename(found)}")
-                captured["path"] = _move_to_desktop(found, target_path)
-                break
-
-            # Fecha popups vazios que o SharePoint abre so para disparar o download.
-            for extra in list(context.pages)[1:]:
-                try:
-                    if extra.url in ("about:blank", "") and not extra.is_closed():
-                        extra.close()
-                except Exception:
-                    pass
-            time.sleep(0.25)
-
-        if not config.KEEP_BROWSER_OPEN:
+            # Deixa a pagina assentar: o SharePoint monta a barra de comandos
+            # depois do DOM, e clicar cedo demais nao dispara a exportacao.
             try:
-                context.close()
+                page.wait_for_load_state("load", timeout=30_000)
             except Exception:
                 pass
+            settle = float(getattr(config, "PAGE_SETTLE_SECONDS", 8))
+            if settle > 0:
+                log(f"Aguardando a pagina assentar ({settle:.0f}s)...")
+                page.wait_for_timeout(int(settle * 1000))
+
+            max_clicks = max(1, int(getattr(config, "EXPORT_CLICK_ATTEMPTS", 3)))
+            retry_after = float(getattr(config, "RETRY_CLICK_AFTER_SECONDS", 50))
+            overall_deadline = time.time() + config.DOWNLOAD_WAIT_SECONDS
+
+            for click_number in range(1, max_clicks + 1):
+                label = f" (tentativa {click_number} de {max_clicks})" if click_number > 1 else ""
+                log(f"Procurando '{config.EXPORT_MENU_ITEM}'{label}...")
+                if not _click_export(page):
+                    raise AutomationError(
+                        f"Nao encontrei o item '{config.EXPORT_MENU_ITEM}' na pagina. "
+                        "Confirme se a pagina carregou logada e se o nome do botao mudou."
+                    )
+
+                log("Aguardando o arquivo exportado...")
+                window_deadline = min(time.time() + retry_after, overall_deadline)
+                if click_number == max_clicks:
+                    window_deadline = overall_deadline
+
+                if _wait_for_file(context, captured, before, target_path,
+                                  window_deadline):
+                    break
+
+                if time.time() >= overall_deadline:
+                    break
+                log("Nada baixou ainda. Vou clicar em 'Export to Excel' novamente.")
+
+        finally:
+            if not config.KEEP_BROWSER_OPEN:
+                try:
+                    context.close()
+                except Exception:
+                    pass
 
     if "path" not in captured:
         raise AutomationError(
             "O download nao foi concluido dentro do tempo limite "
-            f"({config.DOWNLOAD_WAIT_SECONDS}s)."
+            f"({config.DOWNLOAD_WAIT_SECONDS}s). O SharePoint pode estar lento; "
+            "aumente DOWNLOAD_WAIT_SECONDS em config.py e tente de novo."
         )
     return captured["path"]
 
 
+def _wait_for_file(context, captured: dict, before: set, target_path: str,
+                   deadline: float) -> bool:
+    """
+    Espera o arquivo ate 'deadline'. Devolve True se conseguiu.
+
+    Vigia as duas frentes ao mesmo tempo: o evento de download do Playwright e
+    a pasta Downloads (o Edge as vezes baixa sem disparar o evento).
+    """
+    while time.time() < deadline:
+        if "path" in captured:
+            return True
+
+        found = _new_finished_download(before)
+        if found:
+            log(f"Arquivo novo em Downloads: {os.path.basename(found)}")
+            captured["path"] = _move_to_desktop(found, target_path)
+            return True
+
+        # Fecha popups vazios que o SharePoint abre so para disparar o download.
+        for extra in list(context.pages)[1:]:
+            try:
+                if extra.url in ("about:blank", "") and not extra.is_closed():
+                    extra.close()
+            except Exception:
+                pass
+
+        time.sleep(0.25)
+
+    return "path" in captured
+
+
 def _click_export(page) -> bool:
     """
-    Clica em 'Export to Excel' assim que ele existir.
+    Clica em 'Export to Excel' assim que ele estiver realmente pronto.
 
-    Em vez de tentar cada estrategia com um timeout longo (o que somava dezenas
-    de segundos), varre todas as estrategias em ciclos rapidos ate o teto de
-    EXPORT_SEARCH_SECONDS.
+    Varre todas as formas em que o SharePoint pode renderizar o comando, em
+    ciclos curtos, ate o teto de EXPORT_SEARCH_SECONDS.
     """
     name = config.EXPORT_MENU_ITEM
-    deadline = time.time() + config.EXPORT_SEARCH_SECONDS
+    started = time.time()
+    deadline = started + config.EXPORT_SEARCH_SECONDS
     openers_tried = False
 
     def candidates():
@@ -463,11 +543,15 @@ def _click_export(page) -> bool:
             if locator.count() == 0:
                 return False
             target = locator.first
-            if not target.is_visible():
+            # Espera o elemento ficar visivel, parado e habilitado antes de
+            # clicar: clicar num item que ainda esta animando nao dispara nada.
+            target.wait_for(state="visible", timeout=5_000)
+            if not target.is_enabled():
                 return False
-            target.scroll_into_view_if_needed(timeout=3_000)
-            target.click(timeout=8_000)
+            target.scroll_into_view_if_needed(timeout=5_000)
+            target.click(timeout=15_000)
             log(f"Clique efetuado em: {description}")
+            page.wait_for_timeout(800)  # deixa o SharePoint reagir ao clique
             return True
         except Exception:
             return False
@@ -478,18 +562,18 @@ def _click_export(page) -> bool:
                 return True
 
         # Depois de alguns ciclos sem achar, abre os menus que podem escondê-lo.
-        if not openers_tried and time.time() > deadline - config.EXPORT_SEARCH_SECONDS + 6:
+        if not openers_tried and time.time() - started > 8:
             openers_tried = True
             for opener in ("Export", "More options", "More", "..."):
                 try:
                     button = page.get_by_role("button", name=opener, exact=False)
                     if button.count() and button.first.is_visible():
-                        button.first.click(timeout=5_000)
-                        page.wait_for_timeout(600)
+                        button.first.click(timeout=8_000)
+                        page.wait_for_timeout(1_000)
                 except Exception:
                     continue
 
-        page.wait_for_timeout(300)
+        page.wait_for_timeout(400)
 
     return False
 
