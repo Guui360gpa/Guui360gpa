@@ -380,6 +380,7 @@ def _download_once() -> str:
 
     target_path = os.path.join(DESKTOP_DIR, config.IQY_FILENAME)
     captured: dict = {}
+    popups_seen: dict = {}          # pagina -> instante em que apareceu
     before = _snapshot_downloads()
 
     with sync_playwright() as playwright:
@@ -418,7 +419,13 @@ def _download_once() -> str:
                 log(f"Nao foi possivel salvar pelo Playwright ({exc}). "
                     "Vou pegar o arquivo na pasta Downloads.")
 
+        def handle_page(new_page) -> None:
+            """Registra o popup que o SharePoint abre para disparar o download."""
+            popups_seen[new_page] = time.time()
+            log("O SharePoint abriu uma nova janela (e dela que vem o download).")
+
         context.on("download", handle_download)
+        context.on("page", handle_page)
 
         try:
             page = context.pages[0] if context.pages else context.new_page()
@@ -442,11 +449,13 @@ def _download_once() -> str:
                 page.wait_for_timeout(int(settle * 1000))
 
             max_clicks = max(1, int(getattr(config, "EXPORT_CLICK_ATTEMPTS", 3)))
-            retry_after = float(getattr(config, "RETRY_CLICK_AFTER_SECONDS", 50))
+            retry_after = float(getattr(config, "RETRY_CLICK_AFTER_SECONDS", 75))
+            post_click = float(getattr(config, "POST_CLICK_WAIT_SECONDS", 6))
             overall_deadline = time.time() + config.DOWNLOAD_WAIT_SECONDS
 
             for click_number in range(1, max_clicks + 1):
-                label = f" (tentativa {click_number} de {max_clicks})" if click_number > 1 else ""
+                label = (f" (tentativa {click_number} de {max_clicks})"
+                         if click_number > 1 else "")
                 log(f"Procurando '{config.EXPORT_MENU_ITEM}'{label}...")
                 if not _click_export(page):
                     raise AutomationError(
@@ -454,13 +463,19 @@ def _download_once() -> str:
                         "Confirme se a pagina carregou logada e se o nome do botao mudou."
                     )
 
+                # Respiro obrigatorio: o download so comeca depois que o
+                # SharePoint monta a janela auxiliar e responde a requisicao.
+                if post_click > 0:
+                    log(f"Dando {post_click:.0f}s para a exportacao comecar...")
+                    time.sleep(post_click)
+
                 log("Aguardando o arquivo exportado...")
                 window_deadline = min(time.time() + retry_after, overall_deadline)
                 if click_number == max_clicks:
                     window_deadline = overall_deadline
 
                 if _wait_for_file(context, captured, before, target_path,
-                                  window_deadline):
+                                  window_deadline, popups_seen):
                     break
 
                 if time.time() >= overall_deadline:
@@ -484,13 +499,19 @@ def _download_once() -> str:
 
 
 def _wait_for_file(context, captured: dict, before: set, target_path: str,
-                   deadline: float) -> bool:
+                   deadline: float, popups_seen: dict) -> bool:
     """
     Espera o arquivo ate 'deadline'. Devolve True se conseguiu.
 
-    Vigia as duas frentes ao mesmo tempo: o evento de download do Playwright e
-    a pasta Downloads (o Edge as vezes baixa sem disparar o evento).
+    Vigia as duas frentes: o evento de download do Playwright e a pasta
+    Downloads (o Edge as vezes baixa sem disparar o evento).
+
+    IMPORTANTE: a janela auxiliar que o SharePoint abre costuma ficar em
+    'about:blank' justamente enquanto prepara o arquivo. Fecha-la cedo demais
+    CANCELA o download - por isso so encerramos popups bem antigos.
     """
+    grace = float(getattr(config, "POPUP_GRACE_SECONDS", 30))
+
     while time.time() < deadline:
         if "path" in captured:
             return True
@@ -501,10 +522,14 @@ def _wait_for_file(context, captured: dict, before: set, target_path: str,
             captured["path"] = _move_to_desktop(found, target_path)
             return True
 
-        # Fecha popups vazios que o SharePoint abre so para disparar o download.
+        # Faxina conservadora: so fecha popup vazio que ja passou do prazo.
         for extra in list(context.pages)[1:]:
             try:
-                if extra.url in ("about:blank", "") and not extra.is_closed():
+                if extra.is_closed():
+                    continue
+                appeared = popups_seen.setdefault(extra, time.time())
+                if (extra.url in ("about:blank", "")
+                        and time.time() - appeared > grace):
                     extra.close()
             except Exception:
                 pass
@@ -543,15 +568,15 @@ def _click_export(page) -> bool:
             if locator.count() == 0:
                 return False
             target = locator.first
-            # Espera o elemento ficar visivel, parado e habilitado antes de
-            # clicar: clicar num item que ainda esta animando nao dispara nada.
+            # Espera o elemento ficar visivel e habilitado antes de clicar:
+            # clicar num item que ainda esta montando nao dispara nada.
             target.wait_for(state="visible", timeout=5_000)
             if not target.is_enabled():
                 return False
             target.scroll_into_view_if_needed(timeout=5_000)
             target.click(timeout=15_000)
             log(f"Clique efetuado em: {description}")
-            page.wait_for_timeout(800)  # deixa o SharePoint reagir ao clique
+            page.wait_for_timeout(1_500)  # deixa o SharePoint reagir ao clique
             return True
         except Exception:
             return False
