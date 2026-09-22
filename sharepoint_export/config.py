@@ -80,11 +80,21 @@ SLOW_MO_MS = 120                   # freia um pouco os cliques (mais estavel)
 # Tempos do Excel (segundos)
 # --------------------------------------------------------------------------- #
 DATA_LOAD_TIMEOUT_SECONDS = 600    # teto para a carga da base (sai assim que carrega)
+EXCEL_OPEN_TIMEOUT_SECONDS = 120   # teto para o Excel abrir/preparar a consulta
+
+# Monta a consulta web a partir da URL de dentro do .iqy, em vez de pedir ao
+# Excel para interpretar o arquivo. E o caminho mais confiavel: a carga comeca
+# imediatamente e de forma sincrona. Com False, usa Workbooks.Open(.iqy).
+BUILD_QUERY_FROM_IQY = True
 
 # --------------------------------------------------------------------------- #
 # Comportamento
 # --------------------------------------------------------------------------- #
 KEEP_BROWSER_OPEN = False   # fecha o Edge ao terminar
-EXCEL_VISIBLE = False       # Excel em segundo plano: bem mais rapido
+
+# Excel visivel. Mantenha True: com a janela oculta, qualquer pedido de
+# autenticacao do SharePoint fica invisivel e a carga trava sem aviso.
+# O redesenho continua desligado, entao a perda de velocidade e pequena.
+EXCEL_VISIBLE = True
 KEEP_EXCEL_OPEN = False     # fecha o Excel depois de salvar a "Base Nova.xlsx"
 DELETE_IQY_AFTER = False    # True apaga o "query.iqy" ao final

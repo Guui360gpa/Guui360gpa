@@ -690,9 +690,81 @@ XL_CALCULATION_MANUAL = -4135
 XL_CALCULATION_AUTOMATIC = -4105
 MSO_AUTOMATION_SECURITY_LOW = 1   # msoAutomationSecurityLow
 
+# Constantes de consulta web (QueryTable)
+XL_ENTIRE_PAGE = 1
+XL_ALL_TABLES = 2
+XL_WEB_FORMATTING_ALL = 1
+XL_WEB_FORMATTING_RTF = 2
+XL_WEB_FORMATTING_NONE = 3
+
+
+def _com_retry(action, description: str, attempts: int = 6, pause: float = 2.0):
+    """
+    Executa uma chamada COM tolerando o Excel 'ocupado'.
+
+    Quando o Excel esta processando algo, ele rejeita chamadas com
+    'Call was rejected by callee' (RPC_E_CALL_REJECTED). Insistir resolve.
+    """
+    last_error: Optional[Exception] = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return action()
+        except Exception as exc:
+            last_error = exc
+            message = str(exc)
+            busy = ("rejected by callee" in message
+                    or "0x80010001" in message
+                    or "Call was rejected" in message
+                    or "busy" in message.lower())
+            if not busy or attempt == attempts:
+                raise
+            log(f"  Excel ocupado em '{description}'; tentando de novo "
+                f"({attempt}/{attempts})...")
+            time.sleep(pause)
+    raise last_error  # pragma: no cover
+
+
+def _parse_iqy(path: str) -> dict:
+    """
+    Le o .iqy exportado pelo SharePoint.
+
+    Formato:
+        WEB
+        1
+        <url da consulta>
+        <linha em branco>
+        Selection=EntirePage
+        Formatting=None
+        ...
+    """
+    try:
+        with open(path, "r", encoding="utf-8-sig", errors="replace") as handle:
+            lines = [line.strip() for line in handle.read().splitlines()]
+    except OSError as exc:
+        raise AutomationError(f"Nao consegui ler '{path}': {exc}")
+
+    url = ""
+    options: dict = {}
+    for line in lines[2:]:           # as duas primeiras sao 'WEB' e '1'
+        if not line:
+            continue
+        if not url and ("://" in line or line.lower().startswith("//")):
+            url = line
+            continue
+        if "=" in line:
+            key, _, value = line.partition("=")
+            options[key.strip().lower()] = value.strip()
+
+    if not url:
+        raise AutomationError(
+            f"Nao encontrei a URL da consulta dentro de '{os.path.basename(path)}'.\n"
+            "O arquivo baixado pode nao ser um .iqy valido."
+        )
+    return {"url": url, "options": options}
+
 
 def process_in_excel(iqy_path: str) -> str:
-    """Abre o .iqy, aguarda a carga, aplica AutoFit, salva como .xlsx e fecha."""
+    """Carrega a base no Excel, aplica AutoFit, salva como .xlsx e fecha."""
     import pythoncom
     import win32com.client as win32
 
@@ -704,12 +776,10 @@ def process_in_excel(iqy_path: str) -> str:
     try:
         log("Abrindo o Microsoft Excel...")
         excel = win32.DispatchEx("Excel.Application")
-        # Excel invisivel e sem redesenho: a carga e o AutoFit ficam MUITO
-        # mais rapidos, porque o Excel nao gasta tempo pintando a tela.
-        excel.Visible = bool(getattr(config, "EXCEL_VISIBLE", False))
+        excel.Visible = bool(getattr(config, "EXCEL_VISIBLE", True))
         excel.DisplayAlerts = False
         excel.AskToUpdateLinks = False
-        excel.ScreenUpdating = False
+        excel.ScreenUpdating = False   # sem redesenho: bem mais rapido
         try:
             excel.EnableEvents = False
         except Exception:
@@ -719,15 +789,13 @@ def process_in_excel(iqy_path: str) -> str:
         except Exception:
             pass
 
-        log(f"Abrindo a base: {os.path.basename(iqy_path)}")
-        workbook = excel.Workbooks.Open(os.path.abspath(iqy_path))
+        workbook = _open_base(excel, iqy_path)
 
         try:
             excel.Calculation = XL_CALCULATION_MANUAL
         except Exception:
             pass
 
-        _load_data(excel, workbook)
         _autofit_used_range(workbook)
 
         try:
@@ -746,7 +814,9 @@ def process_in_excel(iqy_path: str) -> str:
                 )
 
         log(f"Salvando como: {output_path}")
-        workbook.SaveAs(output_path, FileFormat=XL_OPENXML_WORKBOOK)
+        _com_retry(lambda: workbook.SaveAs(output_path,
+                                           FileFormat=XL_OPENXML_WORKBOOK),
+                   "SaveAs")
         log("Salvo com sucesso.")
 
         if not os.path.exists(output_path):
@@ -759,6 +829,153 @@ def process_in_excel(iqy_path: str) -> str:
     finally:
         _shutdown_excel(excel, workbook)
         pythoncom.CoUninitialize()
+
+
+def _open_base(excel, iqy_path: str):
+    """
+    Abre a base e carrega os dados.
+
+    Caminho principal: le a URL dentro do .iqy e monta a consulta web
+    diretamente, o que dispara a carga na hora e de forma sincrona.
+    Caminho alternativo: entrega o .iqy para o Excel interpretar.
+    """
+    if bool(getattr(config, "BUILD_QUERY_FROM_IQY", True)):
+        try:
+            return _build_workbook_from_iqy(excel, iqy_path)
+        except AutomationError:
+            raise
+        except Exception as exc:
+            log(f"Nao consegui montar a consulta manualmente ({exc}).")
+            log("Vou pedir para o proprio Excel abrir o 'query.iqy'.")
+
+    return _open_iqy_directly(excel, iqy_path)
+
+
+def _build_workbook_from_iqy(excel, iqy_path: str):
+    """Cria a pasta de trabalho e a consulta web a partir da URL do .iqy."""
+    parsed = _parse_iqy(iqy_path)
+    url = parsed["url"]
+    options = parsed["options"]
+    log(f"Consulta lida do '{os.path.basename(iqy_path)}': {url[:90]}...")
+
+    workbook = _com_retry(lambda: excel.Workbooks.Add(), "Workbooks.Add")
+    sheet = workbook.Worksheets(1)
+
+    query_table = _com_retry(
+        lambda: sheet.QueryTables.Add(Connection="URL;" + url,
+                                      Destination=sheet.Range("A1")),
+        "QueryTables.Add",
+    )
+
+    selection = options.get("selection", "").lower()
+    formatting = options.get("formatting", "").lower()
+
+    for attribute, value in (
+        ("BackgroundQuery", False),           # sincrono: sabemos quando acabou
+        ("WebSelectionType",
+         XL_ALL_TABLES if "alltables" in selection else XL_ENTIRE_PAGE),
+        ("WebFormatting",
+         XL_WEB_FORMATTING_ALL if formatting == "all"
+         else XL_WEB_FORMATTING_RTF if formatting == "rtf"
+         else XL_WEB_FORMATTING_NONE),
+        ("WebDisableDateRecognition", True),
+        ("WebDisableRedirections", False),
+        ("AdjustColumnWidth", False),         # o AutoFit vem depois
+        ("SaveData", True),
+        ("RefreshStyle", 1),                  # xlInsertDeleteCells
+    ):
+        try:
+            setattr(query_table, attribute, value)
+        except Exception:
+            pass  # nem toda versao do Excel expoe todas as propriedades
+
+    _refresh_and_wait(excel, workbook, query_table)
+    return workbook
+
+
+def _open_iqy_directly(excel, iqy_path: str):
+    """Plano B: deixa o Excel interpretar o proprio arquivo .iqy."""
+    log(f"Abrindo a base: {os.path.basename(iqy_path)}")
+    workbook = _com_retry(
+        lambda: excel.Workbooks.Open(os.path.abspath(iqy_path)),
+        "Workbooks.Open",
+        attempts=int(getattr(config, "EXCEL_OPEN_TIMEOUT_SECONDS", 120) / 10) or 6,
+        pause=10.0,
+    )
+    try:
+        _com_retry(lambda: workbook.EnableConnections(), "EnableConnections",
+                   attempts=3, pause=1.0)
+        log("Conexoes de dados externos habilitadas.")
+    except Exception:
+        pass  # algumas versoes ja abrem habilitado e lancam erro aqui
+
+    _refresh_and_wait(excel, workbook, None)
+    return workbook
+
+
+def _refresh_and_wait(excel, workbook, query_table) -> None:
+    """
+    Dispara a carga e so volta quando os dados chegarem.
+
+    A atualizacao roda em primeiro plano (BackgroundQuery=False), entao a
+    propria chamada segura o script pelo tempo que a base levar - sem espera
+    fixa: assim que a query termina, seguimos.
+    """
+    started = time.time()
+    log("Carregando a base agora (contagem comecou)...")
+
+    refreshed = False
+    if query_table is not None:
+        try:
+            _com_retry(lambda: query_table.Refresh(BackgroundQuery=False),
+                       "QueryTable.Refresh", attempts=3, pause=3.0)
+            refreshed = True
+        except Exception as exc:
+            log(f"  aviso na atualizacao da consulta: {exc}")
+    else:
+        for sheet in workbook.Worksheets:
+            try:
+                tables = sheet.QueryTables
+                for index in range(1, tables.Count + 1):
+                    table = tables.Item(index)
+                    try:
+                        table.BackgroundQuery = False
+                    except Exception:
+                        pass
+                    try:
+                        _com_retry(lambda t=table: t.Refresh(BackgroundQuery=False),
+                                   "QueryTable.Refresh", attempts=3, pause=3.0)
+                        refreshed = True
+                    except Exception as exc:
+                        log(f"  aviso na atualizacao da consulta: {exc}")
+            except Exception:
+                continue
+
+    if not refreshed:
+        try:
+            _com_retry(lambda: workbook.RefreshAll(), "RefreshAll",
+                       attempts=3, pause=3.0)
+        except Exception:
+            pass
+
+    # Se sobrou alguma consulta rodando em segundo plano, aguarda (com teto).
+    deadline = time.time() + config.DATA_LOAD_TIMEOUT_SECONDS
+    while _is_refreshing(workbook) and time.time() < deadline:
+        time.sleep(1)
+
+    try:
+        excel.CalculateUntilAsyncQueriesDone()
+    except Exception:
+        pass
+
+    rows = _used_rows(workbook)
+    if rows <= 1:
+        raise AutomationError(
+            "A base nao carregou: a planilha continua vazia.\n"
+            "Abra o 'query.iqy' manualmente uma vez, autorize o acesso ao "
+            "SharePoint e rode o script de novo."
+        )
+    log(f"Base carregada: {rows} linhas em {time.time() - started:.0f}s.")
 
 
 def _shutdown_excel(excel, workbook) -> None:
@@ -795,67 +1012,6 @@ def _shutdown_excel(excel, workbook) -> None:
             log("Excel encerrado.")
     except Exception:
         pass
-
-
-def _load_data(excel, workbook) -> None:
-    """
-    Libera a conexao externa e carrega a base.
-
-    A atualizacao e feita em PRIMEIRO PLANO (BackgroundQuery=False): a chamada
-    so retorna quando os dados chegaram, entao nao ha espera fixa nenhuma -
-    assim que a query termina, o script segue.
-    """
-    try:
-        workbook.EnableConnections()
-        log("Conexoes de dados externos habilitadas.")
-    except Exception:
-        pass  # algumas versoes ja abrem habilitado e lancam erro aqui
-
-    started = time.time()
-    log("Carregando a base (o script segue assim que a query terminar)...")
-
-    refreshed = False
-    for sheet in workbook.Worksheets:
-        try:
-            query_tables = sheet.QueryTables
-            for index in range(1, query_tables.Count + 1):
-                query_table = query_tables.Item(index)
-                try:
-                    query_table.BackgroundQuery = False
-                except Exception:
-                    pass
-                try:
-                    query_table.Refresh(BackgroundQuery=False)  # sincrono
-                    refreshed = True
-                except Exception as exc:
-                    log(f"  aviso na atualizacao da query: {exc}")
-        except Exception:
-            continue
-
-    if not refreshed:
-        try:
-            workbook.RefreshAll()
-        except Exception:
-            pass
-
-    # Se sobrou alguma query em segundo plano, espera terminar (com teto).
-    deadline = time.time() + config.DATA_LOAD_TIMEOUT_SECONDS
-    while _is_refreshing(workbook) and time.time() < deadline:
-        time.sleep(1)
-
-    try:
-        excel.CalculateUntilAsyncQueriesDone()
-    except Exception:
-        pass
-
-    rows = _used_rows(workbook)
-    if rows <= 1:
-        raise AutomationError(
-            "A base nao carregou: a planilha continua vazia. "
-            "Abra o 'query.iqy' manualmente uma vez para validar o acesso "
-            "ao SharePoint pelo Excel e rode o script de novo."
-        )
-    log(f"Base carregada: {rows} linhas em {time.time() - started:.0f}s.")
 
 
 def _is_refreshing(workbook) -> bool:

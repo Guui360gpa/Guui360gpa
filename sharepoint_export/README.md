@@ -6,8 +6,8 @@ Automatiza, de ponta a ponta:
 2. Entra no SharePoint e clica em **Export to Excel**.
 3. Intercepta o download (que sai com nome aleatorio), renomeia para **`query.iqy`**
    e coloca na **Area de Trabalho**.
-4. Abre o arquivo no **Excel**, habilita a conexao de dados externos e aguarda a
-   carga da base (padrao: ate 3 minutos).
+4. Le a URL de dentro do `query.iqy`, monta a consulta web no **Excel** e aguarda
+   a carga da base (comeca na hora; sem espera fixa).
 5. Aplica **AutoFit Column Width** e depois **AutoFit Row Height** na area de dados.
 6. Salva como **`Base Nova.xlsx`** na Area de Trabalho e **fecha o Excel**.
 
