@@ -35,6 +35,11 @@ EDGE_PROFILE_DIRECTORY = "Default"
 # e exige que o Edge esteja totalmente fechado.
 USE_PROFILE_COPY = True
 
+# Refaz a copia do perfil a cada execucao. Por padrao False: a copia e criada
+# uma unica vez (na 1a execucao voce faz login nela) e depois e reaproveitada,
+# o que evita conflito com o Edge aberto, que trava arquivos como o "Cookies".
+PROFILE_RESYNC_EACH_RUN = False
+
 # Onde a copia de trabalho do perfil fica guardada (reaproveitada entre runs).
 PROFILE_COPY_DIR = os.path.join(
     os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),

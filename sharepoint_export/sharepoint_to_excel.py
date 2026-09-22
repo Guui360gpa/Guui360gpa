@@ -70,13 +70,57 @@ def edge_is_running() -> bool:
     return "msedge.exe" in output
 
 
+# Pastas/arquivos que nunca precisam ser copiados (cache pesado e estado de
+# sessao que o Edge mantem travado enquanto esta aberto).
+PROFILE_SKIP_NAMES = {
+    "cache", "code cache", "gpucache", "dawncache", "shadercache",
+    "grshadercache", "media cache", "service worker", "crashpad",
+    "sessions", "gcm store", "optimization guide model store",
+    "component_crx_cache", "extensions_crx_cache", "safe browsing",
+}
+
+
+def _copy_profile_tolerant(src: str, dst: str) -> tuple[int, int]:
+    """
+    Copia o perfil do Edge ignorando o que estiver travado por outro processo.
+
+    O Edge mantem 'Cookies', 'Sessions' e afins abertos enquanto roda; um
+    shutil.copytree comum aborta tudo com WinError 32. Aqui cada arquivo e
+    copiado isoladamente e as falhas sao apenas contadas.
+    """
+    copied = skipped = 0
+    for root, dirs, files in os.walk(src):
+        dirs[:] = [d for d in dirs if d.lower() not in PROFILE_SKIP_NAMES]
+
+        relative = os.path.relpath(root, src)
+        destination_root = dst if relative == "." else os.path.join(dst, relative)
+        try:
+            os.makedirs(destination_root, exist_ok=True)
+        except OSError:
+            skipped += len(files)
+            continue
+
+        for name in files:
+            if name.lower() in PROFILE_SKIP_NAMES or name.lower().endswith(".log"):
+                continue
+            try:
+                shutil.copy2(os.path.join(root, name),
+                             os.path.join(destination_root, name))
+                copied += 1
+            except (OSError, shutil.Error):
+                # Arquivo em uso pelo Edge: segue o jogo.
+                skipped += 1
+    return copied, skipped
+
+
 def prepare_profile_dir() -> str:
     """
     Devolve o diretorio de perfil que sera usado pelo Playwright.
 
     O Edge nao permite que dois processos usem o mesmo 'User Data' ao mesmo
-    tempo. Por isso, por padrao, trabalhamos sobre uma copia do perfil, que
-    preserva cookies e sessoes de SSO sem exigir que o usuario feche o Edge.
+    tempo. Por isso, por padrao, trabalhamos sobre uma copia do perfil. A copia
+    e criada uma unica vez (marcador '.profile_seeded'); dali em diante ela tem
+    a propria sessao logada e nao precisa mais ser sincronizada.
     """
     source = config.EDGE_USER_DATA_DIR
     if not source or not os.path.isdir(source):
@@ -100,12 +144,19 @@ def prepare_profile_dir() -> str:
 
     src_profile = os.path.join(source, profile)
     dst_profile = os.path.join(destination, profile)
+    marker = os.path.join(destination, ".profile_seeded")
 
     if not os.path.isdir(src_profile):
         raise AutomationError(
             f"Perfil '{profile}' nao existe em {source}. "
             "Ajuste EDGE_PROFILE_DIRECTORY em config.py."
         )
+
+    already_seeded = os.path.isfile(marker) and os.path.isdir(dst_profile)
+    if already_seeded and not getattr(config, "PROFILE_RESYNC_EACH_RUN", False):
+        log("Usando a copia de perfil ja existente.")
+        _clear_profile_locks(destination)
+        return destination
 
     os.makedirs(destination, exist_ok=True)
 
@@ -118,16 +169,26 @@ def prepare_profile_dir() -> str:
             except OSError:
                 pass
 
-    # Copia (ou atualiza) o perfil. Arquivos travados sao ignorados.
-    log(f"Sincronizando copia do perfil do Edge ('{profile}')... pode demorar na 1a vez.")
-    ignored = shutil.ignore_patterns(
-        "Cache", "Code Cache", "GPUCache", "Service Worker", "DawnCache",
-        "ShaderCache", "GrShaderCache", "Media Cache", "*.log", "Crashpad",
-    )
-    shutil.copytree(src_profile, dst_profile, dirs_exist_ok=True,
-                    ignore=ignored, ignore_dangling_symlinks=True)
+    log(f"Preparando copia do perfil do Edge ('{profile}')... pode demorar na 1a vez.")
+    copied, skipped = _copy_profile_tolerant(src_profile, dst_profile)
+    log(f"Perfil copiado: {copied} arquivos ({skipped} ignorados por estarem em uso).")
+    if skipped:
+        log("Se o SharePoint pedir login nesta janela, faca o login uma vez: "
+            "a sessao fica salva na copia e as proximas execucoes rodam sozinhas.")
 
-    # Remove travas remanescentes da copia.
+    _clear_profile_locks(destination)
+
+    try:
+        with open(marker, "w", encoding="utf-8") as handle:
+            handle.write(datetime.now().isoformat())
+    except OSError:
+        pass
+
+    return destination
+
+
+def _clear_profile_locks(destination: str) -> None:
+    """Remove travas remanescentes da copia do perfil."""
     for lock in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
         lock_path = os.path.join(destination, lock)
         if os.path.exists(lock_path):
@@ -135,8 +196,6 @@ def prepare_profile_dir() -> str:
                 os.remove(lock_path)
             except OSError:
                 pass
-
-    return destination
 
 
 # --------------------------------------------------------------------------- #
