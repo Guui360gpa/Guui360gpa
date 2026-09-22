@@ -301,32 +301,6 @@ def _snapshot_downloads() -> set:
         return set()
 
 
-def _new_finished_download(before: set) -> Optional[str]:
-    """
-    Devolve o arquivo novo e ja finalizado na pasta Downloads, ou None.
-    Consulta unica (sem bloquear): quem chama decide o ritmo do polling.
-    """
-    try:
-        current = set(os.listdir(DOWNLOADS_DIR))
-    except OSError:
-        return None
-
-    candidates = []
-    for name in current - before:
-        lowered = name.lower()
-        if lowered.endswith((".crdownload", ".tmp", ".partial")):
-            continue
-        if not lowered.endswith(config.ACCEPTED_DOWNLOAD_SUFFIXES):
-            continue
-        candidates.append(os.path.join(DOWNLOADS_DIR, name))
-
-    if not candidates:
-        return None
-
-    newest = max(candidates, key=os.path.getmtime)
-    return newest if _file_is_stable(newest) else None
-
-
 def _file_is_stable(path: str) -> bool:
     """Confirma que o arquivo parou de crescer (download concluido)."""
     try:
@@ -340,6 +314,62 @@ def _file_is_stable(path: str) -> bool:
         return True
     except OSError:
         return False
+
+
+def _looks_like_iqy(path: str) -> bool:
+    """Um .iqy e texto e comeca com 'WEB'. Serve para confirmar o .tmp."""
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(16).lstrip()
+        return head[:3].upper() == b"WEB"
+    except OSError:
+        return False
+
+
+def _new_finished_download(before: set) -> Optional[str]:
+    """
+    Devolve o arquivo novo e ja finalizado na pasta Downloads, ou None.
+
+    Inclui os '<guid>.tmp' que o Playwright cria: quando o evento de download
+    nao e consumido, o arquivo fica so com esse nome temporario - e ele e a
+    base exportada. Consulta unica (sem bloquear): quem chama define o ritmo.
+    """
+    try:
+        current = set(os.listdir(DOWNLOADS_DIR))
+    except OSError:
+        return None
+
+    accept_tmp = bool(getattr(config, "ACCEPT_TMP_DOWNLOADS", True))
+    named, temporary = [], []
+
+    for name in current - before:
+        lowered = name.lower()
+        if lowered.endswith((".crdownload", ".partial")):
+            continue  # ainda baixando
+        path = os.path.join(DOWNLOADS_DIR, name)
+        if lowered.endswith(config.ACCEPTED_DOWNLOAD_SUFFIXES):
+            named.append(path)
+        elif accept_tmp and lowered.endswith(".tmp"):
+            temporary.append(path)
+
+    # Prefere um arquivo com extensao de verdade; so depois recorre ao .tmp.
+    for group, is_temp in ((named, False), (temporary, True)):
+        if not group:
+            continue
+        newest = max(group, key=os.path.getmtime)
+        try:
+            if os.path.getsize(newest) == 0:
+                continue
+        except OSError:
+            continue
+        if not _file_is_stable(newest):
+            continue
+        if is_temp and not _looks_like_iqy(newest):
+            log(f"Arquivo temporario '{os.path.basename(newest)}' nao parece um "
+                ".iqy; vou usa-lo assim mesmo.")
+        return newest
+
+    return None
 
 
 def download_export_file() -> str:
@@ -420,16 +450,25 @@ def _download_once() -> str:
                     "Vou pegar o arquivo na pasta Downloads.")
 
         def handle_page(new_page) -> None:
-            """Registra o popup que o SharePoint abre para disparar o download."""
+            """
+            Registra o popup que o SharePoint abre e escuta o download NELE.
+
+            O evento 'download' e emitido pela pagina, nao pelo contexto - por
+            isso ele precisa ser ligado em cada aba/popup que aparecer.
+            """
             popups_seen[new_page] = time.time()
             log("O SharePoint abriu uma nova janela (e dela que vem o download).")
+            try:
+                new_page.on("download", handle_download)
+            except Exception:
+                pass
 
-        context.on("download", handle_download)
         context.on("page", handle_page)
 
         try:
             page = context.pages[0] if context.pages else context.new_page()
             page.set_default_timeout(config.PAGE_LOAD_TIMEOUT_MS)
+            page.on("download", handle_download)  # a aba principal tambem baixa
 
             log(f"Acessando: {config.SHAREPOINT_URL}")
             # 'domcontentloaded' basta para seguir; o SharePoint mantem conexoes
@@ -604,13 +643,42 @@ def _click_export(page) -> bool:
 
 
 def _move_to_desktop(source: str, target_path: str) -> str:
-    """Move o arquivo baixado para a Area de Trabalho com o nome definitivo."""
+    """
+    Leva o arquivo baixado para a Area de Trabalho com o nome definitivo.
+
+    Se o navegador ainda segurar o arquivo (WinError 32), copia em vez de
+    mover e apaga a origem depois, quando der.
+    """
     os.makedirs(os.path.dirname(target_path), exist_ok=True)
     if os.path.exists(target_path):
-        os.remove(target_path)
-    shutil.move(source, target_path)
-    log(f"Arquivo movido para: {target_path}")
-    return target_path
+        try:
+            os.remove(target_path)
+        except OSError:
+            pass
+
+    last_error: Optional[Exception] = None
+    for attempt in range(4):
+        try:
+            shutil.move(source, target_path)
+            log(f"Arquivo movido para: {target_path}")
+            return target_path
+        except (OSError, shutil.Error) as exc:
+            last_error = exc
+            time.sleep(0.5 * (attempt + 1))
+
+    try:
+        shutil.copy2(source, target_path)
+        log(f"Arquivo copiado para: {target_path} (a origem estava em uso).")
+        try:
+            os.remove(source)
+        except OSError:
+            pass
+        return target_path
+    except (OSError, shutil.Error) as exc:
+        raise AutomationError(
+            f"Nao consegui levar o arquivo para a Area de Trabalho: {exc}\n"
+            f"Origem: {source}\nUltimo erro ao mover: {last_error}"
+        )
 
 
 # --------------------------------------------------------------------------- #

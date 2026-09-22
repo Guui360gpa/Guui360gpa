@@ -54,6 +54,11 @@ OUTPUT_XLSX_NAME = "Base Nova.xlsx"
 # Extensoes aceitas como resultado do "Export to Excel".
 ACCEPTED_DOWNLOAD_SUFFIXES = (".iqy", ".xlsx", ".xls", ".csv")
 
+# O Playwright guarda o download com nome aleatorio e extensao ".tmp" ate
+# alguem consumi-lo. Com True, o script tambem adota esses arquivos: e o
+# plano B que garante a captura mesmo se o evento de download falhar.
+ACCEPT_TMP_DOWNLOADS = True
+
 # --------------------------------------------------------------------------- #
 # Tempos do navegador (segundos)
 # --------------------------------------------------------------------------- #
